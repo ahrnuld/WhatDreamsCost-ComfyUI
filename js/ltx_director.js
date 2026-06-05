@@ -552,7 +552,8 @@ const ICONS = {
   plus: `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg>`,
   fit: `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="3" y1="12" x2="21" y2="12"></line><polyline points="8 7 3 12 8 17"></polyline><polyline points="16 7 21 12 16 17"></polyline></svg>`,
   gear: `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg>`,
-  close: `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>`
+  close: `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>`,
+  group: `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="7" width="8" height="10" rx="1"></rect><rect x="14" y="7" width="8" height="10" rx="1"></rect><line x1="10" y1="12" x2="14" y2="12"></line></svg>`
 };
 
 // --- Data Models ---
@@ -604,6 +605,11 @@ class TimelineEditor {
     this.timeline = { segments: [], audioSegments: [] };
     this.selectionType = "image"; // "image" or "audio"
     this.selectedIndex = -1;
+    // Multi-selection of image/text clips (by id), used for grouping. The single
+    // selectedIndex still drives the prompt editor; selectedIds only affects the
+    // highlight and the Group/Ungroup action.
+    this.selectedIds = new Set();
+    this._selectAnchorId = null;
 
     // Interactions
     this._isDragging = false;
@@ -657,6 +663,7 @@ class TimelineEditor {
       this.selectedIndex = 0;
     }
     this.updateUIFromSelection();
+    this.updateGroupButton();
     this.commitChanges(true);
     // Hide settings widgets by default to reduce node clutter.
     // Deferred so all widget types are finalized before we touch them.
@@ -790,6 +797,189 @@ class TimelineEditor {
     this.setWindow(0, 0);
   }
 
+  // --- Grouping ---
+  // A stable, readable HSL color for a group band, derived from the groupId string.
+  groupColor(groupId, alpha = 1) {
+    let h = 0;
+    for (let i = 0; i < groupId.length; i++) h = (h * 31 + groupId.charCodeAt(i)) % 360;
+    return `hsla(${h}, 70%, 58%, ${alpha})`;
+  }
+
+  // Enable/relabel the Group button based on the current image multi-selection.
+  // Shows "Ungroup" when the whole selection is one existing group, "Group" otherwise.
+  updateGroupButton() {
+    if (!this.groupBtn) return;
+    const segs = [...this.selectedIds]
+      .map(id => this.timeline.segments.find(s => s.id === id))
+      .filter(Boolean);
+    const uniqueGroups = new Set(segs.map(s => s.groupId).filter(Boolean));
+    if (segs.length >= 1 && uniqueGroups.size === 1 && segs.every(s => s.groupId)) {
+      this.groupBtn.innerHTML = `${ICONS.group} Ungroup`;
+      this.groupBtn.disabled = false;
+    } else {
+      this.groupBtn.innerHTML = `${ICONS.group} Group`;
+      this.groupBtn.disabled = segs.length < 2;
+    }
+    this.groupBtn.style.opacity = this.groupBtn.disabled ? "0.5" : "1";
+  }
+
+  toggleGroupSelected() {
+    const segs = [...this.selectedIds]
+      .map(id => this.timeline.segments.find(s => s.id === id))
+      .filter(Boolean);
+    if (segs.length === 0) return;
+    const uniqueGroups = new Set(segs.map(s => s.groupId).filter(Boolean));
+    if (uniqueGroups.size === 1 && segs.every(s => s.groupId)) this.ungroupSelected();
+    else this.groupSelected();
+  }
+
+  // Assign a shared groupId to the selected clips. Contiguous-span semantics: every
+  // image/text clip whose start falls inside the selection's span is pulled in, so a
+  // group is always a solid block that renders as one contiguous window.
+  groupSelected() {
+    const segs = [...this.selectedIds]
+      .map(id => this.timeline.segments.find(s => s.id === id))
+      .filter(Boolean);
+    if (segs.length < 2) return;
+    // Membership is ordinal: every clip from the first selected to the last selected
+    // (in left-to-right order) is pulled in. We deliberately do NOT use a geometric
+    // start/end span — length-snapping can make adjacent clips overlap by a frame, which
+    // would let a geometric span sweep in the next clip by accident.
+    const sorted = [...this.timeline.segments].sort((a, b) => a.start - b.start);
+    const idxs = segs.map(s => sorted.findIndex(x => x.id === s.id)).filter(i => i >= 0);
+    const lo = Math.min(...idxs);
+    const hi = Math.max(...idxs);
+    const members = sorted.slice(lo, hi + 1);
+    const gid = "g_" + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+    for (const s of members) s.groupId = gid;
+    this.selectedIds = new Set(members.map(s => s.id));
+    this.updateGroupButton();
+    this.commitChanges();
+  }
+
+  // Remove the groupId from every clip in the selected clips' group(s).
+  ungroupSelected() {
+    const groupIds = new Set(
+      [...this.selectedIds]
+        .map(id => this.timeline.segments.find(s => s.id === id))
+        .filter(Boolean)
+        .map(s => s.groupId)
+        .filter(Boolean)
+    );
+    if (groupIds.size === 0) return;
+    for (const s of this.timeline.segments) {
+      if (s.groupId && groupIds.has(s.groupId)) delete s.groupId;
+    }
+    this.updateGroupButton();
+    this.commitChanges();
+  }
+
+  // Partition image/text segments into render units: each group becomes one unit
+  // (covering its whole span, absorbing any ungrouped clip that sits inside it),
+  // and every remaining clip is its own single unit. Ordered left-to-right.
+  getRenderUnits() {
+    const all = [...this.timeline.segments].sort((a, b) => a.start - b.start);
+    const units = [];
+    const consumed = new Set();
+    for (const seg of all) {
+      if (consumed.has(seg.id)) continue;
+      if (seg.groupId) {
+        // Ordinal span: from the first to the last member of this group, inclusive.
+        // Any ungrouped clip ordinally between members is absorbed into the unit.
+        // (Ordinal, not geometric — see groupSelected for why.)
+        const memberIdxs = all
+          .map((s, idx) => (s.groupId === seg.groupId ? idx : -1))
+          .filter(idx => idx >= 0);
+        const lo = Math.min(...memberIdxs);
+        const hi = Math.max(...memberIdxs);
+        const inRange = all.slice(lo, hi + 1);
+        for (const s of inRange) consumed.add(s.id);
+        units.push({ type: "group", segs: inRange });
+      } else {
+        consumed.add(seg.id);
+        units.push({ type: "single", segs: [seg] });
+      }
+    }
+    return units;
+  }
+
+  // Build a multi-prompt render payload for a group of clips. Only the GROUP TOTAL is
+  // snapped to the LTXV grid; the internal prompt-segment split is free, so an authored
+  // 4s+4s group renders as one 8s pass with the prompt changing at the boundary — exactly
+  // the pre-isolation single-latent behavior, scoped to the group.
+  buildGroupPayload(members) {
+    const segs = [...members].sort((a, b) => a.start - b.start);
+    const spanStart = Math.min(...segs.map(s => s.start));
+    const rawEnd = Math.max(...segs.map(s => s.start + s.length));
+    const rawSpan = Math.max(1, Math.round(rawEnd - spanStart));
+    const total = snapToLTXVGrid(rawSpan);
+
+    // Pack contiguous prompts/lengths relative to spanStart, absorbing gaps into the
+    // previous segment (mirrors commitChanges). Starts shifted so the group begins at 0.
+    const cleanSegs = [];
+    const prompts = [];
+    const lengths = [];
+    const strengths = [];
+    let cursor = 0;
+    let pendingGap = 0;
+    for (const seg of segs) {
+      const localStart = Math.round(seg.start - spanStart);
+      if (localStart > cursor) {
+        const gap = localStart - cursor;
+        if (lengths.length > 0) lengths[lengths.length - 1] += gap;
+        else pendingGap += gap;
+      }
+      const len = Math.round(seg.length);
+      lengths.push(len + pendingGap);
+      prompts.push(seg.prompt || "");
+      pendingGap = 0;
+      cursor = localStart + len;
+
+      if (seg.type !== "text") {
+        strengths.push((seg.guideStrength !== undefined ? seg.guideStrength : 1.0).toFixed(2));
+      }
+      const clean = { ...seg };
+      delete clean.imgObj;
+      clean.start = localStart;
+      clean.length = len;
+      cleanSegs.push(clean);
+    }
+
+    // Pad/trim the last segment so lengths sum exactly to the grid-snapped total.
+    const sumLen = lengths.reduce((a, b) => a + b, 0);
+    const delta = total - sumLen;
+    if (lengths.length > 0 && delta !== 0) {
+      lengths[lengths.length - 1] = Math.max(1, lengths[lengths.length - 1] + delta);
+      const last = cleanSegs[cleanSegs.length - 1];
+      last.length = Math.max(1, last.length + delta);
+    }
+
+    // Audio overlapping the group span — front-clip only, shifted to local coords.
+    const audio = [];
+    for (const aseg of (this.timeline.audioSegments || [])) {
+      const aStart = aseg.start;
+      const aEnd = aseg.start + aseg.length;
+      if (aEnd <= spanStart || aStart >= rawEnd) continue;
+      const clipFront = Math.max(0, spanStart - aStart);
+      const newLen = aseg.length - clipFront;
+      if (newLen <= 0) continue;
+      audio.push({
+        ...aseg,
+        trimStart: (aseg.trimStart || 0) + clipFront,
+        length: newLen,
+        start: Math.max(0, aStart - spanStart),
+      });
+    }
+
+    return {
+      clipLen: total,
+      timelineJson: JSON.stringify({ segments: cleanSegs, audioSegments: audio }),
+      prompt: prompts.join(" | "),
+      lengths: lengths.join(","),
+      guideStrength: strengths.join(","),
+    };
+  }
+
   // Build the JSON-safe form of a single clip + its overlapping audio, with all
   // start positions shifted so the clip begins at frame 0. Used by renderAllClips to
   // present each clip to Python as if it's the only thing on the timeline — sidesteps
@@ -831,6 +1021,7 @@ class TimelineEditor {
       clipLen,
       timelineJson: JSON.stringify({ segments: [cleanSeg], audioSegments: audio }),
       prompt: seg.prompt || "",
+      lengths: String(clipLen),
       guideStrength: (seg.type === "text") ? "" : (seg.guideStrength !== undefined ? seg.guideStrength : 1.0).toFixed(2),
     };
   }
@@ -842,8 +1033,8 @@ class TimelineEditor {
   async renderAllClips() {
     if (this._renderingAll) return;
 
-    const segs = [...(this.timeline.segments || [])].sort((a, b) => a.start - b.start);
-    if (segs.length === 0) {
+    const units = this.getRenderUnits();
+    if (units.length === 0) {
       alert("No clips to render.");
       return;
     }
@@ -851,6 +1042,7 @@ class TimelineEditor {
     const names = [
       "timeline_data", "local_prompts", "segment_lengths", "guide_strength",
       "duration_frames", "duration_seconds", "window_start_frames", "window_end_frames",
+      "isolate_clips",
     ];
     const widgets = {};
     const orig = {};
@@ -862,7 +1054,9 @@ class TimelineEditor {
       }
     }
 
-    if (!window.confirm(`Queue ${segs.length} isolated render${segs.length === 1 ? "" : "s"}, one per clip?`)) {
+    const groupCount = units.filter(u => u.type === "group").length;
+    const detail = groupCount > 0 ? ` (${groupCount} as grouped multi-prompt pass${groupCount === 1 ? "" : "es"})` : "";
+    if (!window.confirm(`Queue ${units.length} render${units.length === 1 ? "" : "s"}${detail}?`)) {
       return;
     }
 
@@ -872,21 +1066,27 @@ class TimelineEditor {
 
     try {
       const fps = this.getFrameRate();
-      for (let i = 0; i < segs.length; i++) {
-        const seg = segs[i];
-        const payload = this.buildIsolatedClipPayload(seg);
+      for (let i = 0; i < units.length; i++) {
+        const unit = units[i];
+        const payload = unit.type === "group"
+          ? this.buildGroupPayload(unit.segs)
+          : this.buildIsolatedClipPayload(unit.segs[0]);
 
         if (widgets.timeline_data)       widgets.timeline_data.value       = payload.timelineJson;
         if (widgets.local_prompts)       widgets.local_prompts.value       = payload.prompt;
-        if (widgets.segment_lengths)     widgets.segment_lengths.value     = String(payload.clipLen);
+        if (widgets.segment_lengths)     widgets.segment_lengths.value     = payload.lengths;
         if (widgets.guide_strength)      widgets.guide_strength.value      = payload.guideStrength;
         if (widgets.duration_frames)     widgets.duration_frames.value     = payload.clipLen;
         if (widgets.duration_seconds)    widgets.duration_seconds.value    = parseFloat((payload.clipLen / fps).toFixed(3));
         if (widgets.window_start_frames) widgets.window_start_frames.value = 0;
         if (widgets.window_end_frames)   widgets.window_end_frames.value   = 0;
+        // Isolation is already done client-side (each payload's timeline_data contains
+        // only this unit's clips), so disable the Python windowing/isolation pass and let
+        // it consume local_prompts/segment_lengths/guide_strength verbatim.
+        if (widgets.isolate_clips)       widgets.isolate_clips.value        = false;
 
         if (this.renderAllBtn) {
-          this.renderAllBtn.innerHTML = `Queuing ${i + 1}/${segs.length}…`;
+          this.renderAllBtn.innerHTML = `Queuing ${i + 1}/${units.length}…`;
         }
 
         await app.queuePrompt(0, 1);
@@ -1068,10 +1268,16 @@ class TimelineEditor {
     deleteBtn.innerHTML = `${ICONS.trash} Delete`;
     deleteBtn.addEventListener("click", () => this.deleteSelectedSegment());
 
+    this.groupBtn = document.createElement("button");
+    this.groupBtn.className = "pr-btn";
+    this.groupBtn.innerHTML = `${ICONS.group} Group`;
+    this.groupBtn.title = "Ctrl/Shift-click clips to multi-select, then group them to render as one pass (multiple prompts, one video).";
+    this.groupBtn.addEventListener("click", () => this.toggleGroupSelected());
+
     this.renderAllBtn = document.createElement("button");
     this.renderAllBtn.className = "pr-btn";
     this.renderAllBtn.innerHTML = `${ICONS.play} Render All Clips`;
-    this.renderAllBtn.title = "Queue one render per clip, each windowed to that clip's range.";
+    this.renderAllBtn.title = "Queue one render per clip (or per group), each isolated to its own range.";
     this.renderAllBtn.addEventListener("click", () => this.renderAllClips());
 
     actionGroup.appendChild(this.fileInput);
@@ -1080,6 +1286,7 @@ class TimelineEditor {
     actionGroup.appendChild(addTextBtn);
     actionGroup.appendChild(uploadAudioBtn);
     actionGroup.appendChild(deleteBtn);
+    actionGroup.appendChild(this.groupBtn);
     actionGroup.appendChild(this.renderAllBtn);
     toolbar.appendChild(actionGroup);
 
@@ -2118,6 +2325,15 @@ class TimelineEditor {
         }
       }
 
+      // Group band: a colored strip along the top edge. Adjacent members share a
+      // color so the group reads as one continuous bar.
+      if (seg.type !== "ghost" && seg.groupId) {
+        this.ctx.fillStyle = this.groupColor(seg.groupId, 0.95);
+        this.ctx.fillRect(startX, RULER_HEIGHT + 1, pxWidth, 5);
+      }
+
+      const inMultiSelect = this.selectedIds && this.selectedIds.has(seg.id) && seg.type !== "ghost";
+
       if (isSelected) {
         this.ctx.strokeStyle = "#fff";
         this.ctx.lineWidth = 2;
@@ -2129,6 +2345,11 @@ class TimelineEditor {
         this.ctx.beginPath();
         this.ctx.roundRect(startX + pxWidth - 4, RULER_HEIGHT + this.blockHeight / 2 - 12, 4, 24, 2);
         this.ctx.fill();
+      } else if (inMultiSelect) {
+        // Part of a multi-selection but not the active (prompt-editing) clip.
+        this.ctx.strokeStyle = "#8fc8ff";
+        this.ctx.lineWidth = 2;
+        this.ctx.strokeRect(startX, RULER_HEIGHT + 1, pxWidth, this.blockHeight - 2);
       } else {
         this.ctx.strokeStyle = "#000";
         this.ctx.lineWidth = 1.5;
@@ -2609,7 +2830,10 @@ class TimelineEditor {
       const clickedTrack = y > RULER_HEIGHT + this.blockHeight ? "audio" : "image";
       if (this.selectionType === clickedTrack) {
         this.selectedIndex = -1;
+        this.selectedIds.clear();
+        this._selectAnchorId = null;
         this.updateUIFromSelection();
+        this.updateGroupButton();
       }
       this.render();
       return;
@@ -2631,6 +2855,43 @@ class TimelineEditor {
 
     this.selectionType = hit.track;
     const targetArray = hit.track === "audio" ? this.timeline.audioSegments : this.timeline.segments;
+
+    // --- Multi-select (image/text track only), for grouping ---
+    // Ctrl/Cmd-click toggles a clip in the set; Shift-click selects the contiguous
+    // range from the anchor. These don't start a drag.
+    if (hit.track === "image" && (hit.type === "center" || hit.dir) &&
+        (e.ctrlKey || e.metaKey || e.shiftKey)) {
+      const clickedSeg = targetArray[hit.index];
+      if (clickedSeg) {
+        if (e.shiftKey && this._selectAnchorId) {
+          const sorted = [...this.timeline.segments].sort((a, b) => a.start - b.start);
+          const ai = sorted.findIndex(s => s.id === this._selectAnchorId);
+          const bi = sorted.findIndex(s => s.id === clickedSeg.id);
+          if (ai >= 0 && bi >= 0) {
+            const [lo, hi] = ai <= bi ? [ai, bi] : [bi, ai];
+            this.selectedIds = new Set(sorted.slice(lo, hi + 1).map(s => s.id));
+          }
+        } else {
+          // Ctrl/Cmd toggle
+          if (this.selectedIds.has(clickedSeg.id)) this.selectedIds.delete(clickedSeg.id);
+          else this.selectedIds.add(clickedSeg.id);
+          this._selectAnchorId = clickedSeg.id;
+        }
+        this.selectedIndex = hit.index;
+        this.updateUIFromSelection();
+        this.updateGroupButton();
+        this.render();
+      }
+      return;
+    }
+
+    // Plain click on an image clip resets multi-selection to just this clip.
+    if (hit.track === "image" && (hit.type === "center" || hit.dir)) {
+      const clickedSeg = targetArray[hit.index];
+      this.selectedIds = clickedSeg ? new Set([clickedSeg.id]) : new Set();
+      this._selectAnchorId = clickedSeg ? clickedSeg.id : null;
+      this.updateGroupButton();
+    }
 
     if (hit.type === "joint") {
       this.selectedIndex = hit.leftIndex;
@@ -2992,13 +3253,22 @@ class TimelineEditor {
 
   // --- Backend Data Sync ---
   commitChanges(skipRender = false) {
-    // Snap image/text clip lengths to LTXV's 8n+1 frame grid so each per-clip render
-    // produces video and audio of identical frame count. Audio segments are untouched —
-    // they're sliced per-clip, not rendered. See snapToLTXVGrid above for rationale.
+    // Snap standalone image/text clip lengths to LTXV's 8n+1 frame grid so each per-clip
+    // render produces video and audio of identical frame count. Grouped clips are skipped:
+    // a group renders as one pass, so only the group's TOTAL is snapped (at render time, in
+    // buildGroupPayload) while the internal split stays free. Audio is untouched — it's sliced
+    // per-clip, not rendered. See snapToLTXVGrid above for rationale.
     for (const seg of this.timeline.segments) {
       if (seg.type === "audio") continue;
+      if (seg.groupId) continue;
       const snapped = snapToLTXVGrid(seg.length);
       if (snapped !== seg.length) seg.length = snapped;
+    }
+
+    // Drop any ids from the multi-selection that no longer exist (e.g. deleted clips).
+    if (this.selectedIds && this.selectedIds.size > 0) {
+      const live = new Set(this.timeline.segments.map(s => s.id));
+      for (const id of [...this.selectedIds]) if (!live.has(id)) this.selectedIds.delete(id);
     }
 
     // Auto-size duration to the content extent before anything reads it.
