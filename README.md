@@ -1,3 +1,9 @@
+# Fork note
+
+This is a fork of WhatDreamsCost-ComfyUI, GPL3-licensed. Changes in this fork: per-clip isolation mode for LTX Director, batch "Render All Clips" button, LTXV-grid-snapping for clip lengths, audio pipeline fixes for seamless concatenation.
+
+These changes enable cleanly rendering a timeline as separate clips in a batch process. This significantly changes the way the LTX director node works. It enables rendering a long timeline on low-VRAM systems, but this can't be mixed with clips consisting of multiple prompts.
+
 # Overview
 
 This will be a collection of free resources for ComfyUI.
