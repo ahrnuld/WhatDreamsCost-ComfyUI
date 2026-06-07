@@ -356,6 +356,49 @@ const STYLES = `
     background: #666
     border-color: #000;
   }
+  .pr-viewport-wrap {
+    position: relative;
+    width: 100%;
+  }
+  .pr-preview-box {
+    position: absolute;
+    top: 8px;
+    right: 8px;
+    width: 30%;
+    max-width: 360px;
+    min-width: 140px;
+    background: rgba(8, 10, 14, 0.86);
+    border: 1px solid #2f6df0;
+    border-radius: 6px;
+    padding: 4px;
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.6);
+    pointer-events: none;
+    display: none;
+    z-index: 20;
+  }
+  .pr-preview-img {
+    display: block;
+    width: 100%;
+    height: auto;
+    max-height: 240px;
+    object-fit: contain;
+    border-radius: 4px;
+    background: #000;
+  }
+  .pr-preview-caption {
+    font-size: 11px;
+    color: #cfd3dc;
+    margin-top: 3px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .pr-preview-empty {
+    font-size: 11px;
+    color: #888;
+    text-align: center;
+    padding: 18px 6px;
+  }
   .pr-zoom-controls {
     display: flex;
     align-items: center;
@@ -1646,6 +1689,7 @@ class TimelineEditor {
     this.seekBar.addEventListener("input", (e) => {
       this.currentFrame = parseInt(e.target.value, 10);
       this.render();
+      this.showPreview();
       if (this.isPlaying) {
         this.playAudio();
       }
@@ -1843,7 +1887,23 @@ class TimelineEditor {
 
 
     this.wrapper.appendChild(toolbar);
-    this.wrapper.appendChild(this.viewport);
+
+    // Wrap the (scrolling) viewport so the playback preview can float over it without scrolling.
+    const viewportWrap = document.createElement("div");
+    viewportWrap.className = "pr-viewport-wrap";
+    viewportWrap.appendChild(this.viewport);
+
+    this.previewBox = document.createElement("div");
+    this.previewBox.className = "pr-preview-box";
+    this.previewImg = document.createElement("img");
+    this.previewImg.className = "pr-preview-img";
+    this.previewCaption = document.createElement("div");
+    this.previewCaption.className = "pr-preview-caption";
+    this.previewBox.appendChild(this.previewImg);
+    this.previewBox.appendChild(this.previewCaption);
+    viewportWrap.appendChild(this.previewBox);
+
+    this.wrapper.appendChild(viewportWrap);
 
     const controlsGroup = document.createElement("div");
     controlsGroup.className = "pr-controls-group";
@@ -2968,6 +3028,7 @@ class TimelineEditor {
       let mouseFrameX = x * (totalFrames / logicalWidth);
       this.currentFrame = clamp(mouseFrameX, 0, totalFrames);
       this.render();
+      this.showPreview();
       if (this.isPlaying) {
         this.playAudio();
       }
@@ -3153,6 +3214,7 @@ class TimelineEditor {
       let mouseFrameX = mouseX * (totalFrames / logicalWidth);
       this.currentFrame = clamp(mouseFrameX, 0, totalFrames);
       this.render();
+      this.showPreview();
       if (this.isPlaying) {
         this.playAudio(); // Scrub (restart from new position)
       }
@@ -4294,6 +4356,57 @@ class TimelineEditor {
   }
 
   // --- Audio Player Engine ---
+  // --- Playback preview ---
+  // The image/text segment whose [start, start+length) contains the given frame.
+  getActiveSegment(frame) {
+    for (const s of this.timeline.segments) {
+      if (frame >= s.start && frame < s.start + s.length) return s;
+    }
+    return null;
+  }
+
+  // The image visually "on screen" at this frame: the active segment's image if it has one,
+  // otherwise the most recent image segment starting at/before the frame.
+  getActiveImageSegment(frame) {
+    const active = this.getActiveSegment(frame);
+    if (active && active.imageB64) return active;
+    let best = null;
+    for (const s of this.timeline.segments) {
+      if (s.imageB64 && s.start <= frame && (!best || s.start > best.start)) best = s;
+    }
+    return best;
+  }
+
+  updatePreviewContent() {
+    if (!this.previewBox) return;
+    const frame = Math.round(this.currentFrame);
+    const active = this.getActiveSegment(frame);
+    const imgSeg = this.getActiveImageSegment(frame);
+
+    if (imgSeg && imgSeg.imageB64) {
+      const src = (imgSeg.imgObj && imgSeg.imgObj.src) || imgSeg.imageB64;
+      if (this.previewImg.getAttribute("src") !== src) this.previewImg.setAttribute("src", src);
+      this.previewImg.style.display = "block";
+    } else {
+      this.previewImg.removeAttribute("src");
+      this.previewImg.style.display = "none";
+    }
+
+    const promptText = (active && active.prompt) || (imgSeg && imgSeg.prompt) || "";
+    const tc = this.formatTime(frame);
+    this.previewCaption.textContent = promptText ? `${tc} — ${promptText}` : tc;
+  }
+
+  showPreview() {
+    if (!this.previewBox) return;
+    this.previewBox.style.display = "block";
+    this.updatePreviewContent();
+  }
+
+  hidePreview() {
+    if (this.previewBox) this.previewBox.style.display = "none";
+  }
+
   updatePlayerUI() {
     if (!this.playBtn || !this.loopBtn) return;
     this.playBtn.innerHTML = this.isPlaying ? ICONS.pause : ICONS.play;
@@ -4344,6 +4457,7 @@ class TimelineEditor {
     if (this._currentPlayId !== playId || !this.isPlaying) return;
 
     this.updatePlayerUI();
+    this.showPreview();
 
     const frameRate = this.getFrameRate();
     this.playbackStartFrame = this.currentFrame;
@@ -4432,6 +4546,7 @@ class TimelineEditor {
       }
 
       this.render();
+      this.updatePreviewContent();
       this._playLoopId = requestAnimationFrame(loop);
     };
 
@@ -4442,8 +4557,11 @@ class TimelineEditor {
     this.isPlaying = false;
     this._currentPlayId = null;
 
-    if (!isScrubbing && this.audioContext && this.audioContext.state === 'running') {
-      try { this.audioContext.suspend(); } catch (e) { }
+    if (!isScrubbing) {
+      this.hidePreview();
+      if (this.audioContext && this.audioContext.state === 'running') {
+        try { this.audioContext.suspend(); } catch (e) { }
+      }
     }
 
     for (let node of this.activeAudioNodes) {
