@@ -1,8 +1,11 @@
 from comfy_extras.nodes_lt import LTXVAddGuide
 import torch
+import logging
 import comfy.utils
 from comfy_api.latest import io
 from .ltx_director import GuideData
+
+log = logging.getLogger(__name__)
 
 
 class LTXDirectorGuide(LTXVAddGuide):
@@ -76,22 +79,43 @@ class LTXDirectorGuide(LTXVAddGuide):
             f_idx = insert_frames[idx] if idx < len(insert_frames) else 0
             strength = strengths[idx] if idx < len(strengths) else 1.0
 
-            image_1, t = cls.encode(vae, latent_width, latent_height, img_tensor, scale_factors)
-            frame_idx, latent_idx = cls.get_latent_index(positive, latent_length, len(image_1), f_idx, scale_factors)
+            # Recompute length each iteration: append_keyframe (the non-Start path) grows the
+            # temporal dimension. Height/width never change.
+            latent_length = latent_image.shape[2]
 
-            assert latent_idx + t.shape[2] <= latent_length, (
-                f"Guide image {idx + 1}: conditioning frames exceed the length of the latent sequence."
+            _img, t = cls.encode(vae, latent_width, latent_height, img_tensor, scale_factors)
+            frame_idx, latent_idx = cls.get_latent_index(
+                positive, latent_length, _img.shape[0], f_idx, scale_factors,
             )
 
-            # Write the guide into the existing latent in-place rather than appending it.
-            # append_keyframe + LTXVCropGuides is the canonical LTXV pattern, but it grows the
-            # latent by 1 frame per guide and requires a downstream crop node — when the crop is
-            # missing (as in most LTXDirector workflows) the appended guide gets VAE-decoded as
-            # 8 extra pixel frames of "distorted start image" at the tail. replace_latent_frames
-            # keeps the latent the size the Director sized it to, so the decoded video is exactly
-            # the requested length with no trailing echo.
-            latent_image, noise_mask = cls.replace_latent_frames(
-                latent_image, noise_mask, t, latent_idx, strength,
+            log.info(
+                "[LTXDirectorGuide] guide %d: insert_frame=%d, latent_idx=%d, strength=%.2f, path=%s",
+                idx + 1, f_idx, latent_idx, strength,
+                "in-place(replace)" if f_idx <= 0 else "keyframe(append)+needs LTXVCropGuides",
             )
+
+            if f_idx <= 0:
+                # --- Start guide: in-place, crop-free ---
+                # Latent slot 0 legitimately represents a single pixel frame, which is exactly
+                # what a one-image encode produces, so we can overwrite it directly. No latent
+                # growth, so no LTXVCropGuides node is required for start-only timelines.
+                if latent_idx + t.shape[2] > latent_length:
+                    latent_idx = max(0, latent_length - t.shape[2])
+                latent_image, noise_mask = cls.replace_latent_frames(
+                    latent_image, noise_mask, t, latent_idx, strength,
+                )
+            else:
+                # --- Center/End guide: keyframe-led (append) ---
+                # A non-first frame can only be pinned cleanly via the RoPE keyframe mechanism,
+                # so the sampler generates the preceding frames to converge onto it. That path
+                # APPENDS guide frames to the latent, which MUST be stripped after the sampler by
+                # an LTXVCropGuides node (between the sampler and VAE Decode). Without it, these
+                # appended frames decode as a short distorted tail.
+                if latent_idx + t.shape[2] > latent_length:
+                    latent_idx = max(0, latent_length - t.shape[2])
+                    frame_idx = latent_idx * scale_factors[0]
+                positive, negative, latent_image, noise_mask = cls.append_keyframe(
+                    positive, negative, frame_idx, latent_image, noise_mask, t, strength, scale_factors,
+                )
 
         return io.NodeOutput(positive, negative, {"samples": latent_image, "noise_mask": noise_mask})

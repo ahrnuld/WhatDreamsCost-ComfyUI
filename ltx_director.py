@@ -159,7 +159,16 @@ def _build_combined_audio(timeline_data_str: str, duration_frames: int, frame_ra
     and aligns to a global timeline yielding ComfyUI's format.
     Output length explicitly mimics the timeline's duration_frames length."""
     target_sr = 44100
-    total_samples = max(1, int(math.ceil(duration_frames / frame_rate * target_sr)))
+
+    # Convert a frame position to an absolute sample index with consistent rounding.
+    # A frame is 1837.5 samples (44100/24), so frame boundaries land BETWEEN samples.
+    # Using round() everywhere (instead of ceil for length + int for start) guarantees that
+    # clip N's end sample == clip N+1's start sample for the same boundary frame — so per-clip
+    # renders butt-join sample-exactly with no 1-sample repeat/gap (the faint click at joins).
+    def _frames_to_samples(frames):
+        return int(round(float(frames) / frame_rate * target_sr))
+
+    total_samples = max(1, _frames_to_samples(duration_frames))
     empty_audio = {"waveform": torch.zeros((1, 2, total_samples), dtype=torch.float32), "sample_rate": target_sr}
 
     if not timeline_data_str:
@@ -233,9 +242,10 @@ def _build_combined_audio(timeline_data_str: str, duration_frames: int, frame_ra
             length_frames = float(seg.get("length", 1))
             start_frames = float(seg.get("start", 0))
 
-            start_sample_src = int(trim_start_frames / frame_rate * target_sr)
-            length_samples = int(length_frames / frame_rate * target_sr)
-            end_sample_src = start_sample_src + length_samples
+            # Derive both ends from ABSOLUTE frame positions with the same rounding, so the
+            # boundary at frame F maps to one fixed sample shared by adjacent clips.
+            start_sample_src = _frames_to_samples(trim_start_frames)
+            end_sample_src = _frames_to_samples(trim_start_frames + length_frames)
 
             if start_sample_src < 0: start_sample_src = 0
             if end_sample_src > waveform.shape[1]:
@@ -248,7 +258,7 @@ def _build_combined_audio(timeline_data_str: str, duration_frames: int, frame_ra
             clip_waveform = waveform[:, start_sample_src:end_sample_src]
 
             # Position onto the timeline
-            start_sample_dst = int(start_frames / frame_rate * target_sr)
+            start_sample_dst = _frames_to_samples(start_frames)
             
             if start_sample_dst >= out_waveform.shape[1]:
                 continue
@@ -731,8 +741,24 @@ class LTXDirector(io.ComfyNode):
                     derived_w = tensor.shape[2]
 
                 strength = strengths[idx] if idx < len(strengths) else 1.0
+
+                # Guide anchor position within the clip. "start" (default) keeps the
+                # legacy image-to-video behavior; "center"/"end" let the model generate
+                # motion that passes through, or arrives at, the guide image. The end
+                # frame lands on the clip's last frame; the downstream clamp keeps it in
+                # the latent's safe range.
+                seg_start = int(seg.get("start", 0))
+                seg_len = int(seg.get("length", 1))
+                guide_pos = str(seg.get("guidePos", "start")).lower()
+                if guide_pos == "end":
+                    insert_f = seg_start + max(0, seg_len - 1)
+                elif guide_pos == "center":
+                    insert_f = seg_start + seg_len // 2
+                else:
+                    insert_f = seg_start
+
                 guide_data["images"].append(tensor)
-                guide_data["insert_frames"].append(int(seg["start"]))
+                guide_data["insert_frames"].append(insert_f)
                 guide_data["strengths"].append(float(strength))
             
             # If no images were loaded from the timeline, create a dummy image at strength 0

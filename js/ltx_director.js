@@ -9,6 +9,7 @@ const CANVAS_HEIGHT = RULER_HEIGHT + BLOCK_HEIGHT + AUDIO_TRACK_HEIGHT;
 const HANDLE_HIT_PX = 14;
 const MIN_SEGMENT_LENGTH = 6;
 const MAX_THUMBNAIL_DIM = 512; // Increased to maintain quality for taller images
+const DEFAULT_IMAGE_SECONDS = 4; // Default length (in seconds) for a newly added image clip
 
 const HIDDEN_WIDGET_NAMES = ["timeline_data", "local_prompts", "segment_lengths", "guide_strength", "audio_data", "use_custom_audio"];
 
@@ -225,6 +226,28 @@ const STYLES = `
   .pr-strength-input:disabled {
     opacity: 0.35;
     cursor: not-allowed;
+  }
+  .pr-guidepos-group {
+    display: inline-flex;
+    gap: 0;
+    border: 1px solid #444;
+    border-radius: 4px;
+    overflow: hidden;
+  }
+  .pr-guidepos-btn {
+    font-size: 11px;
+    color: #cfd3dc;
+    background: #222;
+    border: none;
+    border-left: 1px solid #444;
+    padding: 3px 9px;
+    cursor: pointer;
+  }
+  .pr-guidepos-btn:first-child { border-left: none; }
+  .pr-guidepos-btn:hover { background: #2c2c2c; }
+  .pr-guidepos-btn.active {
+    background: #2f6df0;
+    color: #fff;
   }
   .pr-gap-menu {
     position: fixed;
@@ -823,6 +846,36 @@ class TimelineEditor {
     this.groupBtn.style.opacity = this.groupBtn.disabled ? "0.5" : "1";
   }
 
+  // --- Guide position (Start / Center / End) ---
+  setGuidePos(pos) {
+    if (this.selectionType !== "image") return;
+    const seg = this.timeline.segments[this.selectedIndex];
+    if (!seg || seg.type === "text") return;
+    seg.guidePos = pos;
+    this.updateGuidePosButtons();
+    this.commitChanges();
+  }
+
+  // Show the toggle only for image clips (not text/audio) and reflect the active value.
+  updateGuidePosButtons() {
+    if (!this.guidePosButtons) return;
+    let isImage = false;
+    let pos = "start";
+    if (this.selectionType === "image") {
+      const seg = this.timeline.segments[this.selectedIndex];
+      if (seg && seg.type !== "text") {
+        isImage = true;
+        pos = seg.guidePos || "start";
+      }
+    }
+    const disp = isImage ? "" : "none";
+    if (this.guidePosLabel) this.guidePosLabel.style.display = disp;
+    if (this.guidePosGroup) this.guidePosGroup.style.display = isImage ? "inline-flex" : "none";
+    for (const p in this.guidePosButtons) {
+      this.guidePosButtons[p].classList.toggle("active", isImage && p === pos);
+    }
+  }
+
   toggleGroupSelected() {
     const segs = [...this.selectedIds]
       .map(id => this.timeline.segments.find(s => s.id === id))
@@ -907,7 +960,7 @@ class TimelineEditor {
   // snapped to the LTXV grid; the internal prompt-segment split is free, so an authored
   // 4s+4s group renders as one 8s pass with the prompt changing at the boundary — exactly
   // the pre-isolation single-latent behavior, scoped to the group.
-  buildGroupPayload(members) {
+  buildGroupPayload(members, outputStartFrame = null) {
     const segs = [...members].sort((a, b) => a.start - b.start);
     const spanStart = Math.min(...segs.map(s => s.start));
     const rawEnd = Math.max(...segs.map(s => s.start + s.length));
@@ -954,21 +1007,32 @@ class TimelineEditor {
       last.length = Math.max(1, last.length + delta);
     }
 
-    // Audio overlapping the group span — front-clip only, shifted to local coords.
+    // Audio overlapping the group span. When outputStartFrame is given (Render All Clips),
+    // slice from the CUMULATIVE output position instead of the authored span start, so units
+    // tile the song contiguously. This is what fixes the skip at group joins: the group's
+    // grid-snapped render length (`total`) differs from its authored span, so authored-position
+    // slicing would overlap the next unit's audio by exactly that difference.
     const audio = [];
     for (const aseg of (this.timeline.audioSegments || [])) {
       const aStart = aseg.start;
       const aEnd = aseg.start + aseg.length;
       if (aEnd <= spanStart || aStart >= rawEnd) continue;
-      const clipFront = Math.max(0, spanStart - aStart);
-      const newLen = aseg.length - clipFront;
-      if (newLen <= 0) continue;
-      audio.push({
-        ...aseg,
-        trimStart: (aseg.trimStart || 0) + clipFront,
-        length: newLen,
-        start: Math.max(0, aStart - spanStart),
-      });
+      if (outputStartFrame !== null) {
+        let srcTrim = (aseg.trimStart || 0) + outputStartFrame - aStart;
+        let dstStart = 0;
+        if (srcTrim < 0) { dstStart = -srcTrim; srcTrim = 0; }
+        audio.push({ ...aseg, trimStart: srcTrim, length: aseg.length, start: dstStart });
+      } else {
+        const clipFront = Math.max(0, spanStart - aStart);
+        const newLen = aseg.length - clipFront;
+        if (newLen <= 0) continue;
+        audio.push({
+          ...aseg,
+          trimStart: (aseg.trimStart || 0) + clipFront,
+          length: newLen,
+          start: Math.max(0, aStart - spanStart),
+        });
+      }
     }
 
     return {
@@ -984,7 +1048,7 @@ class TimelineEditor {
   // start positions shifted so the clip begins at frame 0. Used by renderAllClips to
   // present each clip to Python as if it's the only thing on the timeline — sidesteps
   // _window_timeline entirely, so overlapping/adjacent clips can't leak in.
-  buildIsolatedClipPayload(seg) {
+  buildIsolatedClipPayload(seg, outputStartFrame = null) {
     // Snap to grid here too — if anything ever bypassed commitChanges with a non-grid length,
     // the rendered video and audio frame counts must still match for seamless concatenation.
     const clipLen = snapToLTXVGrid(seg.length);
@@ -997,24 +1061,30 @@ class TimelineEditor {
     cleanSeg.start = 0;
     cleanSeg.length = clipLen;
 
-    // Mirror the Python _window_timeline behavior: only front-clip the audio.
-    // Trailing samples past clipEnd are clipped downstream by total_samples in
-    // _build_combined_audio, which prevents ~0.04s of silence at the end vs. the
-    // single-clip codepath.
+    // Audio. With outputStartFrame (Render All Clips) we slice from the CUMULATIVE output
+    // position so units tile the song contiguously regardless of grid-snap rounding; otherwise
+    // we only front-clip (legacy single-render behavior).
     const audio = [];
     for (const aseg of (this.timeline.audioSegments || [])) {
       const aStart = aseg.start;
       const aEnd = aseg.start + aseg.length;
       if (aEnd <= clipStart || aStart >= clipEnd) continue;
-      const clipFront = Math.max(0, clipStart - aStart);
-      const newLen = aseg.length - clipFront;
-      if (newLen <= 0) continue;
-      audio.push({
-        ...aseg,
-        trimStart: (aseg.trimStart || 0) + clipFront,
-        length: newLen,
-        start: Math.max(0, aStart - clipStart),
-      });
+      if (outputStartFrame !== null) {
+        let srcTrim = (aseg.trimStart || 0) + outputStartFrame - aStart;
+        let dstStart = 0;
+        if (srcTrim < 0) { dstStart = -srcTrim; srcTrim = 0; }
+        audio.push({ ...aseg, trimStart: srcTrim, length: aseg.length, start: dstStart });
+      } else {
+        const clipFront = Math.max(0, clipStart - aStart);
+        const newLen = aseg.length - clipFront;
+        if (newLen <= 0) continue;
+        audio.push({
+          ...aseg,
+          trimStart: (aseg.trimStart || 0) + clipFront,
+          length: newLen,
+          start: Math.max(0, aStart - clipStart),
+        });
+      }
     }
 
     return {
@@ -1066,11 +1136,16 @@ class TimelineEditor {
 
     try {
       const fps = this.getFrameRate();
+      // Cumulative position of the current unit within the stitched output, in frames.
+      // Audio is sliced from this contiguous cursor (not each unit's authored start) so the
+      // song tiles seamlessly across joins even when group units snap to a different length.
+      let outCursor = 0;
       for (let i = 0; i < units.length; i++) {
         const unit = units[i];
         const payload = unit.type === "group"
-          ? this.buildGroupPayload(unit.segs)
-          : this.buildIsolatedClipPayload(unit.segs[0]);
+          ? this.buildGroupPayload(unit.segs, outCursor)
+          : this.buildIsolatedClipPayload(unit.segs[0], outCursor);
+        outCursor += payload.clipLen;
 
         if (widgets.timeline_data)       widgets.timeline_data.value       = payload.timelineJson;
         if (widgets.local_prompts)       widgets.local_prompts.value       = payload.prompt;
@@ -1458,7 +1533,10 @@ class TimelineEditor {
         this._ghostInitialTimeline = JSON.parse(JSON.stringify(arrToModify));
 
         const frameRate = this.getFrameRate();
-        const newLength = Math.max(1, frameRate * 1);
+        // Image ghost previews at the default image length; audio stays ~1s (its real
+        // length is determined from the dropped file on drop).
+        const ghostSeconds = trackType === "image" ? DEFAULT_IMAGE_SECONDS : 1;
+        const newLength = Math.max(1, frameRate * ghostSeconds);
 
         let mouseFrameX = x * (totalFrames / logicalWidth);
         let startFrame = clamp(Math.round(mouseFrameX - newLength / 2), 0, totalFrames - newLength);
@@ -1737,10 +1815,31 @@ class TimelineEditor {
       }
     });
 
+    // --- Guide Position Toggle (Start / Center / End) ---
+    // Where the clip's image anchors in the rendered range: Start = image-to-video
+    // (default), End = video arrives at the image, Center = passes through it.
+    this.guidePosLabel = document.createElement("span");
+    this.guidePosLabel.className = "pr-strength-label";
+    this.guidePosLabel.textContent = "Image at:";
+
+    this.guidePosGroup = document.createElement("div");
+    this.guidePosGroup.className = "pr-guidepos-group";
+    this.guidePosButtons = {};
+    for (const pos of ["start", "center", "end"]) {
+      const btn = document.createElement("button");
+      btn.className = "pr-guidepos-btn";
+      btn.textContent = pos.charAt(0).toUpperCase() + pos.slice(1);
+      btn.addEventListener("click", () => this.setGuidePos(pos));
+      this.guidePosButtons[pos] = btn;
+      this.guidePosGroup.appendChild(btn);
+    }
+
     this.strengthRow.appendChild(this.timeCodeDisplay);
     this.strengthRow.appendChild(this.segmentBoundsDisplay);
     this.strengthRow.appendChild(strengthLabel);
     this.strengthRow.appendChild(this.strengthValue);
+    this.strengthRow.appendChild(this.guidePosLabel);
+    this.strengthRow.appendChild(this.guidePosGroup);
 
 
     this.wrapper.appendChild(toolbar);
@@ -1812,7 +1911,7 @@ class TimelineEditor {
     const frameRate = this.getFrameRate();
     const durationFrames = this.getDurationFrames();
     // Snap to LTXV grid so the new clip is renderable as a self-contained unit.
-    const newLength = snapToLTXVGrid(explicitLength !== null ? explicitLength : frameRate * 1);
+    const newLength = snapToLTXVGrid(explicitLength !== null ? explicitLength : frameRate * DEFAULT_IMAGE_SECONDS);
 
     for (let file of files) {
       if (!file.type.startsWith("image/")) continue;
@@ -2115,6 +2214,8 @@ class TimelineEditor {
         this.segmentBoundsDisplay.textContent = "Start: - | End: -";
       }
     }
+
+    this.updateGuidePosButtons();
   }
 
   // --- Rendering logic ---
@@ -2330,6 +2431,26 @@ class TimelineEditor {
       if (seg.type !== "ghost" && seg.groupId) {
         this.ctx.fillStyle = this.groupColor(seg.groupId, 0.95);
         this.ctx.fillRect(startX, RULER_HEIGHT + 1, pxWidth, 5);
+      }
+
+      // Guide-position marker: a small triangle at the clip's bottom edge showing where
+      // the image anchors (left=Start, center=Center, right=End). Image clips only.
+      if (seg.type !== "ghost" && seg.type !== "text" && pxWidth > 14) {
+        const gp = seg.guidePos || "start";
+        let mx = startX + 7;
+        if (gp === "center") mx = startX + pxWidth / 2;
+        else if (gp === "end") mx = startX + pxWidth - 7;
+        const by = RULER_HEIGHT + this.blockHeight - 1;
+        this.ctx.fillStyle = "#2f6df0";
+        this.ctx.beginPath();
+        this.ctx.moveTo(mx - 6, by);
+        this.ctx.lineTo(mx + 6, by);
+        this.ctx.lineTo(mx, by - 8);
+        this.ctx.closePath();
+        this.ctx.fill();
+        this.ctx.strokeStyle = "rgba(255,255,255,0.8)";
+        this.ctx.lineWidth = 1;
+        this.ctx.stroke();
       }
 
       const inMultiSelect = this.selectedIds && this.selectedIds.has(seg.id) && seg.type !== "ghost";
