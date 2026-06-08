@@ -3732,6 +3732,53 @@ class TimelineEditor {
     }
   }
 
+  // Replace the image of an existing clip in place (keeps id, position, length, prompt,
+  // guide position/strength, group, lock, etc.). Prompts for a file, uploads it, then
+  // swaps only the image fields on the live segment.
+  swapSegmentImage(seg) {
+    const input = document.createElement("input");
+    input.type = "file";
+    input.accept = "image/*";
+    input.style.display = "none";
+    input.addEventListener("change", async (e) => {
+      const file = e.target.files && e.target.files[0];
+      if (!file || !file.type.startsWith("image/")) { input.remove(); return; }
+      try {
+        const body = new FormData();
+        body.append("image", file);
+        const resp = await api.fetchApi("/upload/image", { method: "POST", body });
+        if (resp.status !== 200) { input.remove(); return; }
+
+        const data = await resp.json();
+        const filename = data.name;
+        const subfolder = data.subfolder || "";
+        const imageFile = subfolder ? subfolder + "/" + filename : filename;
+        const imgUrl = api.apiURL(`/view?filename=${encodeURIComponent(filename)}&type=input&subfolder=${encodeURIComponent(subfolder)}`);
+
+        const img = new Image();
+        img.onload = () => {
+          const target = this.timeline.segments.find(s => s.id === seg.id);
+          if (target) {
+            target.imageFile = imageFile;
+            target.imageB64 = imgUrl;
+            target.imgObj = img;
+            target.type = "image"; // ensure it's treated as an image clip
+          }
+          this.commitChanges();
+          this.render();
+          input.remove();
+        };
+        img.onerror = () => { input.remove(); };
+        img.src = imgUrl;
+      } catch (err) {
+        console.error("Swap image failed", err);
+        input.remove();
+      }
+    });
+    document.body.appendChild(input);
+    input.click();
+  }
+
   showContextMenu(clientX, clientY, seg, trackType) {
     this.dismissContextMenu();
     const menu = document.createElement("div");
@@ -3781,6 +3828,15 @@ class TimelineEditor {
         this.dismissContextMenu();
       };
       menu.appendChild(openBtn);
+
+      const swapBtn = document.createElement("button");
+      swapBtn.className = "pr-gap-menu-btn";
+      swapBtn.innerHTML = `Swap Image…`;
+      swapBtn.onclick = () => {
+        this.swapSegmentImage(seg);
+        this.dismissContextMenu();
+      };
+      menu.appendChild(swapBtn);
     }
 
     if (trackType !== "audio") {
