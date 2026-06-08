@@ -619,7 +619,9 @@ const ICONS = {
   fit: `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="3" y1="12" x2="21" y2="12"></line><polyline points="8 7 3 12 8 17"></polyline><polyline points="16 7 21 12 16 17"></polyline></svg>`,
   gear: `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg>`,
   close: `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>`,
-  group: `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="7" width="8" height="10" rx="1"></rect><rect x="14" y="7" width="8" height="10" rx="1"></rect><line x1="10" y1="12" x2="14" y2="12"></line></svg>`
+  group: `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="7" width="8" height="10" rx="1"></rect><rect x="14" y="7" width="8" height="10" rx="1"></rect><line x1="10" y1="12" x2="14" y2="12"></line></svg>`,
+  lock: `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2"></rect><path d="M7 11V7a5 5 0 0 1 10 0v4"></path></svg>`,
+  unlock: `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2"></rect><path d="M7 11V7a5 5 0 0 1 9.9-1"></path></svg>`
 };
 
 // --- Data Models ---
@@ -730,6 +732,7 @@ class TimelineEditor {
     }
     this.updateUIFromSelection();
     this.updateGroupButton();
+    this.updateLockButton();
     this.commitChanges(true);
     // Hide settings widgets by default to reduce node clutter.
     // Deferred so all widget types are finalized before we touch them.
@@ -887,6 +890,49 @@ class TimelineEditor {
       this.groupBtn.disabled = segs.length < 2;
     }
     this.groupBtn.style.opacity = this.groupBtn.disabled ? "0.5" : "1";
+  }
+
+  // --- Lock in place ---
+  // The clips the lock action operates on: the multi-selection if any, else the single
+  // selected image/text clip.
+  getLockTargets() {
+    let segs = [...this.selectedIds]
+      .map(id => this.timeline.segments.find(s => s.id === id))
+      .filter(Boolean);
+    if (segs.length === 0 && this.selectionType === "image" && this.selectedIndex >= 0) {
+      const s = this.timeline.segments[this.selectedIndex];
+      if (s) segs = [s];
+    }
+    return segs;
+  }
+
+  updateLockButton() {
+    if (!this.lockBtn) return;
+    const segs = this.getLockTargets();
+    const anyLocked = segs.some(s => s.locked);
+    if (segs.length >= 1 && segs.every(s => s.locked)) {
+      this.lockBtn.innerHTML = `${ICONS.unlock} Unlock`;
+      this.lockBtn.disabled = false;
+    } else {
+      this.lockBtn.innerHTML = `${ICONS.lock} Lock in place`;
+      this.lockBtn.disabled = segs.length < 1;
+    }
+    // Tint when the selection includes a locked clip.
+    this.lockBtn.style.opacity = this.lockBtn.disabled ? "0.5" : "1";
+    this.lockBtn.style.color = anyLocked ? "#ffd479" : "";
+  }
+
+  toggleLockSelected() {
+    const segs = this.getLockTargets();
+    if (segs.length === 0) return;
+    // If every target is already locked → unlock; otherwise lock them all.
+    const lock = !segs.every(s => s.locked);
+    for (const s of segs) {
+      if (lock) s.locked = true;
+      else delete s.locked;
+    }
+    this.updateLockButton();
+    this.commitChanges();
   }
 
   // --- Guide position (Start / Center / End) ---
@@ -1392,6 +1438,12 @@ class TimelineEditor {
     this.groupBtn.title = "Ctrl/Shift-click clips to multi-select, then group them to render as one pass (multiple prompts, one video).";
     this.groupBtn.addEventListener("click", () => this.toggleGroupSelected());
 
+    this.lockBtn = document.createElement("button");
+    this.lockBtn.className = "pr-btn";
+    this.lockBtn.innerHTML = `${ICONS.lock} Lock in place`;
+    this.lockBtn.title = "Lock the selected clip(s) so their position and length can't be changed by dragging.";
+    this.lockBtn.addEventListener("click", () => this.toggleLockSelected());
+
     this.renderAllBtn = document.createElement("button");
     this.renderAllBtn.className = "pr-btn";
     this.renderAllBtn.innerHTML = `${ICONS.play} Render All Clips`;
@@ -1405,6 +1457,7 @@ class TimelineEditor {
     actionGroup.appendChild(uploadAudioBtn);
     actionGroup.appendChild(deleteBtn);
     actionGroup.appendChild(this.groupBtn);
+    actionGroup.appendChild(this.lockBtn);
     actionGroup.appendChild(this.renderAllBtn);
     toolbar.appendChild(actionGroup);
 
@@ -2276,6 +2329,7 @@ class TimelineEditor {
     }
 
     this.updateGuidePosButtons();
+    this.updateLockButton();
   }
 
   // --- Rendering logic ---
@@ -2511,6 +2565,25 @@ class TimelineEditor {
         this.ctx.strokeStyle = "rgba(255,255,255,0.8)";
         this.ctx.lineWidth = 1;
         this.ctx.stroke();
+      }
+
+      // Locked badge: a small lock glyph in the top-left corner of the clip.
+      if (seg.type !== "ghost" && seg.locked && pxWidth > 18) {
+        const lx = startX + 4, ly = RULER_HEIGHT + 5;
+        this.ctx.save();
+        this.ctx.fillStyle = "rgba(20, 24, 32, 0.85)";
+        this.ctx.fillRect(lx - 2, ly - 2, 16, 16);
+        this.ctx.strokeStyle = "#ffd479";
+        this.ctx.lineWidth = 1.5;
+        this.ctx.lineJoin = "round";
+        // shackle
+        this.ctx.beginPath();
+        this.ctx.arc(lx + 6, ly + 4, 3, Math.PI, 0);
+        this.ctx.stroke();
+        // body
+        this.ctx.fillStyle = "#ffd479";
+        this.ctx.fillRect(lx + 1, ly + 4, 10, 7);
+        this.ctx.restore();
       }
 
       const inMultiSelect = this.selectedIds && this.selectedIds.has(seg.id) && seg.type !== "ghost";
@@ -3075,6 +3148,24 @@ class TimelineEditor {
       this.updateGroupButton();
     }
 
+    // --- Locked clips can't be moved or resized ---
+    // Selection still works (so the user can unlock), but we never start a drag on a locked
+    // clip, nor a rolling-edit (joint) where either side is locked.
+    const hitIsLocked = hit.type === "joint"
+      ? (targetArray[hit.leftIndex]?.locked || targetArray[hit.rightIndex]?.locked)
+      : (hit.index !== undefined && targetArray[hit.index]?.locked);
+    if (hit.track === "image" && hitIsLocked) {
+      if (hit.index !== undefined) {
+        this.selectedIndex = hit.index;
+      } else if (hit.type === "joint") {
+        this.selectedIndex = hit.leftIndex;
+      }
+      this.updateUIFromSelection();
+      this.updateGroupButton();
+      this.render();
+      return;
+    }
+
     if (hit.type === "joint") {
       this.selectedIndex = hit.leftIndex;
       this.updateUIFromSelection();
@@ -3364,25 +3455,27 @@ class TimelineEditor {
     }
 
     for (let i = D_index + 1; i < t_test.length; i++) {
+      if (t_test[i].locked) continue; // locked clips never move (act as fixed walls)
       let prev = t_test[i - 1];
       t_test[i].start = Math.max(t_test[i].original_start, prev.start + prev.length);
     }
 
     for (let i = D_index - 1; i >= 0; i--) {
+      if (t_test[i].locked) continue; // locked clips never move (act as fixed walls)
       let next = t_test[i + 1];
       t_test[i].start = Math.min(t_test[i].original_start, next.start - t_test[i].length);
     }
 
     let rightCursor = durationFrames;
     for (let i = t_test.length - 1; i >= 0; i--) {
-      if (t_test[i].start + t_test[i].length > rightCursor) {
+      if (!t_test[i].locked && t_test[i].start + t_test[i].length > rightCursor) {
         t_test[i].start = rightCursor - t_test[i].length;
       }
       rightCursor = t_test[i].start;
     }
     let leftCursor = 0;
     for (let i = 0; i < t_test.length; i++) {
-      if (t_test[i].start < leftCursor) {
+      if (!t_test[i].locked && t_test[i].start < leftCursor) {
         t_test[i].start = leftCursor;
       }
       leftCursor = t_test[i].start + t_test[i].length;
@@ -3444,6 +3537,7 @@ class TimelineEditor {
     for (const seg of this.timeline.segments) {
       if (seg.type === "audio") continue;
       if (seg.groupId) continue;
+      if (seg.locked) continue; // never auto-resize a locked clip
       const snapped = snapToLTXVGrid(seg.length);
       if (snapped !== seg.length) seg.length = snapped;
     }
