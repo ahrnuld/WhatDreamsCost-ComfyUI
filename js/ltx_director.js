@@ -339,27 +339,39 @@ const STYLES = `
     width: 100%;
     overflow-x: auto;
     overflow-y: hidden;
+    scrollbar-width: none; /* hide native bar; we provide a custom one below */
   }
   .pr-timeline-viewport::-webkit-scrollbar {
-    height: 10px;
-  }
-  .pr-timeline-viewport::-webkit-scrollbar-track {
-    background: #151515;
-    border-radius: 5px;
-  }
-  .pr-timeline-viewport::-webkit-scrollbar-thumb {
-    background: #444
-    border-radius: 5px;
-    border: 1px solid #000;
-  }
-  .pr-timeline-viewport::-webkit-scrollbar-thumb:hover {
-    background: #666
-    border-color: #000;
+    height: 0;
+    display: none;
   }
   .pr-viewport-wrap {
     position: relative;
     width: 100%;
   }
+  .pr-hscroll {
+    position: relative;
+    width: 100%;
+    height: 12px;
+    margin-top: 4px;
+    background: #151515;
+    border-radius: 6px;
+    display: none;
+    cursor: pointer;
+    user-select: none;
+  }
+  .pr-hscroll-thumb {
+    position: absolute;
+    top: 1px;
+    left: 0;
+    height: 10px;
+    min-width: 24px;
+    background: #4a4a4a;
+    border-radius: 5px;
+    cursor: grab;
+  }
+  .pr-hscroll-thumb:hover { background: #5e5e5e; }
+  .pr-hscroll-thumb:active { background: #2f6df0; cursor: grabbing; }
   .pr-preview-box {
     position: absolute;
     top: 8px;
@@ -1958,6 +1970,64 @@ class TimelineEditor {
 
     this.wrapper.appendChild(viewportWrap);
 
+    // --- Custom horizontal scrollbar (below the timeline) ---
+    this.hScroll = document.createElement("div");
+    this.hScroll.className = "pr-hscroll";
+    this.hScrollThumb = document.createElement("div");
+    this.hScrollThumb.className = "pr-hscroll-thumb";
+    this.hScroll.appendChild(this.hScrollThumb);
+    this.wrapper.appendChild(this.hScroll);
+
+    // Keep the thumb in sync while the viewport scrolls (trackpad/wheel/programmatic).
+    this.viewport.addEventListener("scroll", () => this.updateScrollbar());
+
+    // Drag the thumb to scroll. We use POINTER CAPTURE so move/up events are delivered to
+    // the thumb itself regardless of what's underneath the cursor — without it, ComfyUI's
+    // LiteGraph canvas captures the pointer inside the node bounds and the drag gets stuck.
+    this.hScrollThumb.addEventListener("pointerdown", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      try { this.hScrollThumb.setPointerCapture(e.pointerId); } catch (_) { }
+      const maxThumbX = Math.max(1, this.hScroll.clientWidth - this.hScrollThumb.offsetWidth);
+      this._hScrollDrag = {
+        startX: e.clientX,
+        startScroll: this.viewport.scrollLeft,
+        maxScroll: Math.max(0, this.viewport.scrollWidth - this.viewport.clientWidth),
+        maxThumbX,
+      };
+    });
+
+    this.hScrollThumb.addEventListener("pointermove", (e) => {
+      if (!this._hScrollDrag) return;
+      e.preventDefault();
+      const d = this._hScrollDrag;
+      const dx = e.clientX - d.startX;
+      this.viewport.scrollLeft = clamp(d.startScroll + (dx / d.maxThumbX) * d.maxScroll, 0, d.maxScroll);
+      this.updateScrollbar();
+    });
+
+    const endThumbDrag = (e) => {
+      if (!this._hScrollDrag) return;
+      this._hScrollDrag = null;
+      try { this.hScrollThumb.releasePointerCapture(e.pointerId); } catch (_) { }
+    };
+    this.hScrollThumb.addEventListener("pointerup", endThumbDrag);
+    this.hScrollThumb.addEventListener("pointercancel", endThumbDrag);
+
+    // Click the track (outside the thumb) to jump.
+    this.hScroll.addEventListener("pointerdown", (e) => {
+      if (e.target === this.hScrollThumb) return;
+      e.preventDefault();
+      e.stopPropagation();
+      const rect = this.hScroll.getBoundingClientRect();
+      const thumbW = this.hScrollThumb.offsetWidth;
+      const maxThumbX = Math.max(1, this.hScroll.clientWidth - thumbW);
+      const maxScroll = Math.max(0, this.viewport.scrollWidth - this.viewport.clientWidth);
+      const targetThumbX = clamp(e.clientX - rect.left - thumbW / 2, 0, maxThumbX);
+      this.viewport.scrollLeft = (targetThumbX / maxThumbX) * maxScroll;
+      this.updateScrollbar();
+    });
+
     const controlsGroup = document.createElement("div");
     controlsGroup.className = "pr-controls-group";
     controlsGroup.appendChild(this.strengthRow);
@@ -2005,6 +2075,27 @@ class TimelineEditor {
     this.canvas.height = targetHeight;
     this.ctx.setTransform(scale, 0, 0, scale, 0, 0);
     this.render();
+    this.updateScrollbar();
+  }
+
+  // Size and position the custom horizontal scrollbar thumb to mirror the viewport's
+  // scroll state. Hidden when the timeline fully fits in the node.
+  updateScrollbar() {
+    if (!this.hScroll || !this.viewport) return;
+    const scrollW = this.viewport.scrollWidth;
+    const clientW = this.viewport.clientWidth;
+    if (scrollW <= clientW + 1) {
+      this.hScroll.style.display = "none";
+      return;
+    }
+    this.hScroll.style.display = "block";
+    const trackW = this.hScroll.clientWidth;
+    const thumbW = Math.max(24, (clientW / scrollW) * trackW);
+    const maxScroll = scrollW - clientW;
+    const maxThumbX = Math.max(0, trackW - thumbW);
+    const thumbX = maxScroll > 0 ? (this.viewport.scrollLeft / maxScroll) * maxThumbX : 0;
+    this.hScrollThumb.style.width = thumbW + "px";
+    this.hScrollThumb.style.transform = `translateX(${thumbX}px)`;
   }
 
   // Helper to map mouse events accurately regardless of canvas scaling
