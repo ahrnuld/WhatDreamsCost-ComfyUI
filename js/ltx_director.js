@@ -1197,19 +1197,9 @@ class TimelineEditor {
     };
   }
 
-  // Queue one render per clip, each in true isolation: the timeline_data widget is
-  // temporarily replaced with a single-clip JSON so Python sees only that one clip
-  // (and any audio overlapping it). Window widgets are forced to 0 so the Python-side
-  // windowing logic is bypassed entirely. All widgets are restored when done.
-  async renderAllClips() {
-    if (this._renderingAll) return;
-
-    const units = this.getRenderUnits();
-    if (units.length === 0) {
-      alert("No clips to render.");
-      return;
-    }
-
+  // The render widgets that renderAllClips / renderSelectedClip temporarily override, paired
+  // with their current values so the caller can restore them afterwards.
+  grabRenderWidgets() {
     const names = [
       "timeline_data", "local_prompts", "segment_lengths", "guide_strength",
       "duration_frames", "duration_seconds", "window_start_frames", "window_end_frames",
@@ -1224,6 +1214,129 @@ class TimelineEditor {
         orig[n] = w.value;
       }
     }
+    return { widgets, orig };
+  }
+
+  // Build the render payload for one render unit (group or single clip). `outCursor` is the
+  // unit's cumulative start in the stitched output (sum of preceding units' snapped render
+  // lengths) so audio is sliced contiguously — the single source of the "Render All Clips"
+  // tiling math, reused by the single-clip path so the two can never diverge.
+  buildUnitPayload(unit, outCursor) {
+    return unit.type === "group"
+      ? this.buildGroupPayload(unit.segs, outCursor)
+      : this.buildIsolatedClipPayload(unit.segs[0], outCursor);
+  }
+
+  // Push a unit payload onto the temporary render widgets. Mirrors what each iteration of
+  // renderAllClips queues, so a single-clip re-render produces byte-identical output to the
+  // same clip in a full batch. Isolation is done client-side (payload.timelineJson holds only
+  // this unit's clips), so the Python windowing/isolation pass is disabled.
+  applyUnitPayload(widgets, payload, fps) {
+    if (widgets.timeline_data)       widgets.timeline_data.value       = payload.timelineJson;
+    if (widgets.local_prompts)       widgets.local_prompts.value       = payload.prompt;
+    if (widgets.segment_lengths)     widgets.segment_lengths.value     = payload.lengths;
+    if (widgets.guide_strength)      widgets.guide_strength.value      = payload.guideStrength;
+    if (widgets.duration_frames)     widgets.duration_frames.value     = payload.clipLen;
+    if (widgets.duration_seconds)    widgets.duration_seconds.value    = parseFloat((payload.clipLen / fps).toFixed(3));
+    if (widgets.window_start_frames) widgets.window_start_frames.value = 0;
+    if (widgets.window_end_frames)   widgets.window_end_frames.value   = 0;
+    if (widgets.isolate_clips)       widgets.isolate_clips.value        = false;
+  }
+
+  // Locate the render unit containing the currently-selected image/text clip, together with
+  // its cumulative output cursor (sum of preceding units' snapped render lengths — the same
+  // value renderAllClips would reach for that unit). Returns null if no image clip is selected.
+  selectedRenderUnit() {
+    if (this.selectionType !== "image") return null;
+    const seg = this.timeline.segments[this.selectedIndex];
+    if (!seg) return null;
+    const units = this.getRenderUnits();
+    let outCursor = 0;
+    for (let i = 0; i < units.length; i++) {
+      const unit = units[i];
+      if (unit.segs.some(s => s.id === seg.id)) {
+        return { unit, outCursor, index: i, total: units.length };
+      }
+      // Advance by this unit's snapped render length — read it from the real payload builder
+      // so it can't drift from the value the batch accumulates.
+      outCursor += this.buildUnitPayload(unit, outCursor).clipLen;
+    }
+    return null;
+  }
+
+  // Re-render just the selected clip exactly as "Render All Clips" rendered it, so the output
+  // is a drop-in replacement: same snapped length, same audio slice (taken from the unit's
+  // cumulative output position, not its authored timeline position).
+  async renderSelectedClip() {
+    if (this._renderingAll) return;
+
+    const found = this.selectedRenderUnit();
+    if (!found) {
+      alert("Select a single image/text clip in the timeline first.");
+      return;
+    }
+    const { unit, outCursor, index, total } = found;
+
+    const label = unit.type === "group" ? "grouped clip" : "clip";
+    if (!window.confirm(`Re-render ${label} ${index + 1} of ${total}? It will match what "Render All Clips" produced for it.`)) {
+      return;
+    }
+
+    const { widgets, orig } = this.grabRenderWidgets();
+    const origBtnHtml = this.renderClipBtn ? this.renderClipBtn.innerHTML : null;
+    this._renderingAll = true;
+    if (this.renderClipBtn) this.renderClipBtn.disabled = true;
+    if (this.renderAllBtn) this.renderAllBtn.disabled = true;
+
+    try {
+      const fps = this.getFrameRate();
+      const payload = this.buildUnitPayload(unit, outCursor);
+      this.applyUnitPayload(widgets, payload, fps);
+      if (this.renderClipBtn) this.renderClipBtn.innerHTML = "Queuing…";
+      await app.queuePrompt(0, 1);
+    } catch (err) {
+      console.error("[LTXDirector] Render This Clip failed:", err);
+      alert("Render This Clip failed: " + (err && err.message ? err.message : err));
+    } finally {
+      for (const n in orig) {
+        if (widgets[n]) widgets[n].value = orig[n];
+      }
+      this._renderingAll = false;
+      if (this.renderClipBtn) {
+        this.renderClipBtn.disabled = false;
+        if (origBtnHtml !== null) this.renderClipBtn.innerHTML = origBtnHtml;
+      }
+      if (this.renderAllBtn) this.renderAllBtn.disabled = false;
+      this.updateRenderClipButton();
+      this.render();
+    }
+  }
+
+  // Enable the "Render This Clip" button only when a single image/text clip is selected.
+  updateRenderClipButton() {
+    if (!this.renderClipBtn) return;
+    const enabled = !this._renderingAll
+      && this.selectionType === "image"
+      && this.selectedIndex >= 0
+      && !!this.timeline.segments[this.selectedIndex];
+    this.renderClipBtn.disabled = !enabled;
+    this.renderClipBtn.style.opacity = enabled ? "1" : "0.5";
+  }
+
+  // Queue one render per clip, each in true isolation: the timeline_data widget is
+  // temporarily replaced with a single-clip JSON so Python sees only that one clip
+  // (and any audio overlapping it). Window widgets are forced to 0 so the Python-side
+  // windowing logic is bypassed entirely. All widgets are restored when done.
+  async renderAllClips() {
+    if (this._renderingAll) return;
+
+    const units = this.getRenderUnits();
+    if (units.length === 0) {
+      alert("No clips to render.");
+      return;
+    }
+
+    const { widgets, orig } = this.grabRenderWidgets();
 
     const groupCount = units.filter(u => u.type === "group").length;
     const detail = groupCount > 0 ? ` (${groupCount} as grouped multi-prompt pass${groupCount === 1 ? "" : "es"})` : "";
@@ -1234,6 +1347,7 @@ class TimelineEditor {
     const origBtnHtml = this.renderAllBtn ? this.renderAllBtn.innerHTML : null;
     this._renderingAll = true;
     if (this.renderAllBtn) this.renderAllBtn.disabled = true;
+    this.updateRenderClipButton();
 
     try {
       const fps = this.getFrameRate();
@@ -1243,23 +1357,10 @@ class TimelineEditor {
       let outCursor = 0;
       for (let i = 0; i < units.length; i++) {
         const unit = units[i];
-        const payload = unit.type === "group"
-          ? this.buildGroupPayload(unit.segs, outCursor)
-          : this.buildIsolatedClipPayload(unit.segs[0], outCursor);
+        const payload = this.buildUnitPayload(unit, outCursor);
         outCursor += payload.clipLen;
 
-        if (widgets.timeline_data)       widgets.timeline_data.value       = payload.timelineJson;
-        if (widgets.local_prompts)       widgets.local_prompts.value       = payload.prompt;
-        if (widgets.segment_lengths)     widgets.segment_lengths.value     = payload.lengths;
-        if (widgets.guide_strength)      widgets.guide_strength.value      = payload.guideStrength;
-        if (widgets.duration_frames)     widgets.duration_frames.value     = payload.clipLen;
-        if (widgets.duration_seconds)    widgets.duration_seconds.value    = parseFloat((payload.clipLen / fps).toFixed(3));
-        if (widgets.window_start_frames) widgets.window_start_frames.value = 0;
-        if (widgets.window_end_frames)   widgets.window_end_frames.value   = 0;
-        // Isolation is already done client-side (each payload's timeline_data contains
-        // only this unit's clips), so disable the Python windowing/isolation pass and let
-        // it consume local_prompts/segment_lengths/guide_strength verbatim.
-        if (widgets.isolate_clips)       widgets.isolate_clips.value        = false;
+        this.applyUnitPayload(widgets, payload, fps);
 
         if (this.renderAllBtn) {
           this.renderAllBtn.innerHTML = `Queuing ${i + 1}/${units.length}…`;
@@ -1279,6 +1380,7 @@ class TimelineEditor {
         this.renderAllBtn.disabled = false;
         if (origBtnHtml !== null) this.renderAllBtn.innerHTML = origBtnHtml;
       }
+      this.updateRenderClipButton();
       this.render();
     }
   }
@@ -1456,6 +1558,12 @@ class TimelineEditor {
     this.lockBtn.title = "Lock the selected clip(s) so their position and length can't be changed by dragging.";
     this.lockBtn.addEventListener("click", () => this.toggleLockSelected());
 
+    this.renderClipBtn = document.createElement("button");
+    this.renderClipBtn.className = "pr-btn";
+    this.renderClipBtn.innerHTML = `${ICONS.play} Render This Clip`;
+    this.renderClipBtn.title = "Re-render only the selected clip, matching exactly what \"Render All Clips\" produced for it (drop-in replacement).";
+    this.renderClipBtn.addEventListener("click", () => this.renderSelectedClip());
+
     this.renderAllBtn = document.createElement("button");
     this.renderAllBtn.className = "pr-btn";
     this.renderAllBtn.innerHTML = `${ICONS.play} Render All Clips`;
@@ -1470,6 +1578,7 @@ class TimelineEditor {
     actionGroup.appendChild(deleteBtn);
     actionGroup.appendChild(this.groupBtn);
     actionGroup.appendChild(this.lockBtn);
+    actionGroup.appendChild(this.renderClipBtn);
     actionGroup.appendChild(this.renderAllBtn);
     toolbar.appendChild(actionGroup);
 
@@ -2421,6 +2530,7 @@ class TimelineEditor {
 
     this.updateGuidePosButtons();
     this.updateLockButton();
+    this.updateRenderClipButton();
   }
 
   // --- Rendering logic ---
@@ -2474,6 +2584,9 @@ class TimelineEditor {
       const bSel = isAudioSelection && b.id === activeAudioSegId;
       return aSel - bSel;
     });
+
+    // Edges where adjacent clips don't connect exactly (gap or overlap) — flagged red.
+    const disconnectedEdges = this.getDisconnectedEdges(renderSegments);
 
     // --- Draw Image/Text Segments ---
     for (let i = 0; i < sortedSegments.length; i++) {
@@ -2700,6 +2813,31 @@ class TimelineEditor {
         this.ctx.lineWidth = 1.5;
         this.ctx.strokeRect(startX, RULER_HEIGHT + 1, pxWidth, this.blockHeight - 2);
       }
+
+      // Disconnect warning: bold red line on any edge that doesn't meet its neighbor exactly
+      // (gap or overlap). Drawn last so it sits on top of the clip border.
+      const disc = seg.type !== "ghost" ? disconnectedEdges.get(seg.id) : null;
+      if (disc) {
+        this.ctx.save();
+        this.ctx.globalAlpha = 1.0;
+        this.ctx.strokeStyle = "#ff3b30";
+        this.ctx.lineWidth = 3;
+        const yTop = RULER_HEIGHT + 1, yBot = RULER_HEIGHT + this.blockHeight - 1;
+        if (disc.left) {
+          this.ctx.beginPath();
+          this.ctx.moveTo(startX + 1.5, yTop);
+          this.ctx.lineTo(startX + 1.5, yBot);
+          this.ctx.stroke();
+        }
+        if (disc.right) {
+          this.ctx.beginPath();
+          this.ctx.moveTo(startX + pxWidth - 1.5, yTop);
+          this.ctx.lineTo(startX + pxWidth - 1.5, yBot);
+          this.ctx.stroke();
+        }
+        this.ctx.restore();
+      }
+
       this.ctx.globalAlpha = 1.0;
     }
 
@@ -4597,6 +4735,28 @@ class TimelineEditor {
   }
 
   // --- Audio Player Engine ---
+  // Returns a Map(segId -> {left, right}) marking edges where an image/text clip does NOT
+  // connect exactly to its neighbor (a gap or overlap). Used to draw red warning lines.
+  getDisconnectedEdges(segments) {
+    const bad = new Map();
+    const segs = (segments || [])
+      .filter(s => s && s.type !== "ghost" && s.type !== "temp")
+      .map(s => ({ id: s.id, start: s.start, length: s.length }))
+      .sort((a, b) => a.start - b.start);
+    const mark = (id, side) => {
+      if (!bad.has(id)) bad.set(id, { left: false, right: false });
+      bad.get(id)[side] = true;
+    };
+    for (let i = 0; i < segs.length - 1; i++) {
+      const a = segs[i], b = segs[i + 1];
+      if (Math.round(a.start + a.length) !== Math.round(b.start)) {
+        mark(a.id, "right");
+        mark(b.id, "left");
+      }
+    }
+    return bad;
+  }
+
   // --- Playback preview ---
   // The image/text segment whose [start, start+length) contains the given frame.
   getActiveSegment(frame) {
